@@ -12,5 +12,5 @@ id = "a546c6f127064f30a68d41ef0120a21d"
 
 [vars]
 # 一键复制按钮里的 skill 安装来源
-SKILL_SOURCE = "https://github.com/helloiamkitty/vibecoding/tree/main/dasu-agent/skill"
+SKILL_SOURCE = "https://github.com/helloiamkitty/dasu-agent"
 BOARD_URL = "https://agent.dskk.uk"
