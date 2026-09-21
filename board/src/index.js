@@ -167,6 +167,75 @@ async function publicRequest(env, r, { withMessages } = {}) {
   return out;
 }
 
+// ---------- open 局索引 ----------
+// idx:open = [轻量局快照...]（1 次读即可列出全部报名中，避免全表扫描 + N+1）
+// my:{playerId} = [该局相关的 reqId...]（inbox 用，避免全量拉取）
+const OPEN_IDX_KEY = "idx:open";
+const IDX_CAP = 200;
+
+function openEntry(r, ownerPub) {
+  return {
+    id: r.id, region: r.region, court: r.court, window: r.window,
+    playersNeeded: r.playersNeeded, costShare: r.costShare, note: r.note,
+    levelReq: r.levelReq, applicantCount: (r.applicants || []).length,
+    owner: ownerPub ? { name: ownerPub.name, dims: ownerPub.dims, ntrp: ownerPub.ntrp,
+                        stats: ownerPub.stats, receivedTags: ownerPub.receivedTags } : null,
+    createdAt: r.createdAt
+  };
+}
+
+function entryExpired(e) {
+  const end = e.window && e.window.dateEnd;
+  return end && end < todayStr();
+}
+
+async function idxAdd(env, r, ownerPub) {
+  await kvRmw(env, OPEN_IDX_KEY, (arr) => {
+    arr = (arr || []).filter(x => x.id !== r.id && !entryExpired(x));
+    arr.unshift(openEntry(r, ownerPub));
+    return arr.slice(0, IDX_CAP);
+  });
+}
+async function idxPatch(env, id, patch) {
+  await kvRmw(env, OPEN_IDX_KEY, (arr) => {
+    if (!arr) return undefined;
+    const i = arr.findIndex(x => x.id === id);
+    if (i < 0) return undefined;
+    arr[i] = Object.assign({}, arr[i], patch);
+    return arr;
+  });
+}
+async function idxRemove(env, id) {
+  await kvRmw(env, OPEN_IDX_KEY, (arr) => {
+    if (!arr) return undefined;
+    const next = arr.filter(x => x.id !== id);
+    return next.length === arr.length ? undefined : next;
+  });
+}
+async function myAdd(env, playerId, reqId) {
+  await kvRmw(env, "my:" + playerId, (arr) => {
+    arr = arr || [];
+    if (arr.includes(reqId)) return undefined;
+    arr.unshift(reqId);
+    return arr.slice(0, 100);
+  });
+}
+
+// KV 读-改-写辅助（KV 无原子操作；并发覆盖靠业务层重试校验兜底，根治需 Durable Object/D1）
+async function kvRmw(env, key, fn) {
+  let lastErr = null;
+  for (let i = 0; i < 4; i++) {
+    try {
+      const cur = await env.BOARD_KV.get(key, "json");
+      const next = await fn(cur === null ? null : cur);
+      if (next === undefined) return null;
+      await env.BOARD_KV.put(key, JSON.stringify(next));
+      return next;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("并发冲突，请重试");
+}
+
 // ---------- 鉴权 ----------
 
 async function authedPlayer(req, env) {
@@ -305,21 +374,57 @@ export default {
         me.stats = me.stats || { organized: 0, played: 0, partners: [] };
         me.stats.organized = (me.stats.organized || 0) + 1;
         await savePlayer(env, me);
+        await idxAdd(env, r, publicPlayer(me));
+        await myAdd(env, me.id, r.id);
         return j({ id: r.id, request: await publicRequest(env, r) });
       }
 
+      // 与我相关的局（from my:{playerId} 索引，1 读 + 仅自己的 N 读）
+      if (path === "/api/my/requests" && method === "GET") {
+        const me = await authedPlayer(req, env);
+        if (!me) return err("未授权", 401);
+        const ids = (await env.BOARD_KV.get("my:" + me.id, "json")) || [];
+        const out = [];
+        for (const id of ids) {
+          const r = await env.BOARD_KV.get("req:" + id, "json");
+          if (!r) continue;
+          const pr = await publicRequest(env, r, { withMessages: true });
+          out.push(Object.assign(pr, {
+            role: r.ownerId === me.id ? "发起" : "报名",
+            myStatus: r.ownerId === me.id ? r.status
+              : ((r.applicants || []).find(a => a.playerId === me.id) || {}).status || null
+          }));
+        }
+        return j({ requests: out });
+      }
+
       if (path === "/api/requests" && method === "GET") {
-        const list = await env.BOARD_KV.list({ prefix: "req:" });
         const q = url.searchParams;
         const region = cleanStr(q.get("region"), 50);
-        let out = [];
-        for (const k of list.keys) {
-          const r = await env.BOARD_KV.get(k.name, "json");
-          if (!r) continue;
-          if (q.get("status") === "open" && !(r.status === "open" && !isExpired(r))) continue;
-          if (region && !(r.region || "").includes(region)) continue;
-          out.push(await publicRequest(env, r));
+        // open：走索引（1 次读）；顺手惰性清理过期条目
+        if (q.get("status") === "open") {
+          const arr = (await env.BOARD_KV.get(OPEN_IDX_KEY, "json")) || [];
+          const live = arr.filter(e => !entryExpired(e));
+          let out = region ? live.filter(e => (e.region || "").includes(region)) : live;
+          out = out.slice(0, 50);
+          if (live.length !== arr.length) {
+            await env.BOARD_KV.put(OPEN_IDX_KEY, JSON.stringify(live));
+          }
+          return j({ requests: out });
         }
+        // 全量（管理/调试用途，消耗大）：处理 1000 键 cursor
+        let out = [];
+        let cursor = undefined;
+        do {
+          const page = await env.BOARD_KV.list({ prefix: "req:", cursor });
+          for (const k of page.keys) {
+            const r = await env.BOARD_KV.get(k.name, "json");
+            if (!r) continue;
+            if (region && !(r.region || "").includes(region)) continue;
+            out.push(await publicRequest(env, r));
+          }
+          cursor = page.list_complete ? undefined : page.cursor;
+        } while (cursor);
         out.sort((a, b) => b.createdAt - a.createdAt);
         return j({ requests: out });
       }
@@ -388,6 +493,10 @@ export default {
             r.levelReq = lr;
           }
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          if (r.status === "open") {
+            const owner = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+            await idxPatch(env, reqId, openEntry(r, owner ? publicPlayer(owner) : null));
+          }
           return j({ ok: true, request: await publicRequest(env, r) });
         }
 
@@ -396,23 +505,31 @@ export default {
         if (sub === "/apply" && method === "POST") {
           if (!me) return err("未授权", 401);
           if (me.id === r.ownerId) return err("不能报名自己的约球");
-          if (!(r.status === "open" && !isExpired(r))) return err("该约球已关闭或过期");
-          if ((r.applicants || []).some(a => a.playerId === me.id)) return err("你已报名过");
-          if ((r.applicants || []).length >= 20) return err("该约球报名已满（20 人上限）");
-          // 每账号每日报名上限（防批量薅号；正常球友一天报不了 10 局）
-          const t = todayStr();
-          me.daily = me.daily || { date: t, applies: 0 };
-          if (me.daily.date !== t) me.daily = { date: t, applies: 0 };
-          if (me.daily.applies >= 10) return err("今日报名次数已达上限（10 次），明天再来");
-          me.daily.applies += 1;
           const b = await req.json();
-          r.applicants.push({
-            playerId: me.id, name: me.name, dims: me.dims,
-            message: cleanStr(b.message, 300), status: "pending", appliedAt: Date.now()
-          });
-          r.messages.push({ from: "system", fromName: "系统", text: me.name + " 报名了这局。", at: Date.now() });
-          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          const msg = cleanStr(b.message, 300);
+          // 读-改-写带冲突校验重试（KV 无原子操作，内测期够用；根治需 Durable Object/D1）
+          let applied = false;
+          for (let attempt = 0; attempt < 3 && !applied; attempt++) {
+            const cur = await env.BOARD_KV.get("req:" + reqId, "json");
+            if (!cur) return err("约球需求不存在", 404);
+            if (!(cur.status === "open" && !isExpired(cur))) return err("该约球已关闭或过期");
+            if ((cur.applicants || []).some(a => a.playerId === me.id)) return err("你已报名过");
+            if ((cur.applicants || []).length >= 20) return err("该约球报名已满（20 人上限）");
+            const t = todayStr();
+            me.daily = me.daily || { date: t, applies: 0 };
+            if (me.daily.date !== t) me.daily = { date: t, applies: 0 };
+            if (me.daily.applies >= 10) return err("今日报名次数已达上限（10 次），明天再来");
+            cur.applicants.push({ playerId: me.id, name: me.name, dims: me.dims, message: msg, status: "pending", appliedAt: Date.now() });
+            cur.messages.push({ from: "system", fromName: "系统", text: me.name + " 报名了这局。", at: Date.now() });
+            await env.BOARD_KV.put("req:" + reqId, JSON.stringify(cur));
+            const verify = await env.BOARD_KV.get("req:" + reqId, "json");
+            applied = verify && (verify.applicants || []).some(a => a.playerId === me.id);
+          }
+          if (!applied) return err("报名冲突，请重试");
+          me.daily.applies += 1;
           await savePlayer(env, me);
+          await idxPatch(env, reqId, { applicantCount: (r.applicants || []).length + 1 });
+          await myAdd(env, me.id, reqId);
           return j({ ok: true, status: "applied",
                      note: "已报名。发起人通过后你会拿到他的微信号和加好友暗号，你的 agent 会定期帮你盯结果。" });
         }
@@ -454,6 +571,7 @@ export default {
           if (approved.length >= needOthers) {
             becameConfirmed = true;
             r.status = "confirmed";
+            await idxRemove(env, reqId);
             for (const x of r.applicants) {
               if (x.status === "pending") x.status = "declined";
             }
@@ -465,8 +583,10 @@ export default {
               const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
               for (const ap of approved) {
                 const guest = await env.BOARD_KV.get("player:" + ap.playerId, "json");
+                // 防刷信誉：任一方账号注册不足 7 天，本局不计入双方平台数据
+                const oldEnough = (p) => p && (Date.now() - p.createdAt) >= 7 * 24 * 3600 * 1000;
+                if (!oldEnough(guest) || !oldEnough(host)) continue;
                 for (const p of [guest, host]) {
-                  if (!p) continue;
                   p.stats = p.stats || { organized: 0, played: 0, partners: [] };
                   p.stats.played = (p.stats.played || 0) + 1;
                   const partnerId = p.id === r.ownerId ? ap.playerId : r.ownerId;
@@ -503,6 +623,8 @@ export default {
           }
           r.messages.push({ from: "system", fromName: "系统", text: "发起人重新打开了报名（原暗号作废）。", at: Date.now() });
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          const owner = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+          await idxAdd(env, r, owner ? publicPlayer(owner) : null);
           return j({ ok: true, status: "open" });
         }
 
@@ -512,7 +634,8 @@ export default {
           if (r.status !== "open" && r.status !== "confirmed") return err("当前状态不可取消");
           r.status = "cancelled";
           r.messages.push({ from: "system", fromName: "系统", text: "发起人取消了本次约球。", at: Date.now() });
-          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r), { expirationTtl: 30 * 24 * 3600 });
+          await idxRemove(env, reqId);
           return j({ ok: true });
         }
 
@@ -536,7 +659,7 @@ export default {
           if (r.status !== "confirmed") return err("仅进行中的约球可标记完成");
           r.status = "completed";
           r.completedAt = Date.now();
-          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r), { expirationTtl: 30 * 24 * 3600 });
           return j({ ok: true });
         }
 
@@ -555,9 +678,9 @@ export default {
           r.tags = r.tags || [];
           r.tags.push({ fromId: me.id, toId, tags, at: Date.now() });
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-          // 累计到对方档案
+          // 累计到对方档案（防刷号：注册不足 7 天的账号不计标签）
           const target = await env.BOARD_KV.get("player:" + toId, "json");
-          if (target) {
+          if (target && (Date.now() - target.createdAt) >= 7 * 24 * 3600 * 1000) {
             target.receivedTags = target.receivedTags || {};
             for (const t of tags) target.receivedTags[t] = (target.receivedTags[t] || 0) + 1;
             await savePlayer(env, target);
@@ -648,36 +771,24 @@ function ownerLine(o) {
 }
 
 async function feedPage(env, url) {
-  const list = await env.BOARD_KV.list({ prefix: "req:" });
-  let items = [];
-  for (const k of list.keys) {
-    const r = await env.BOARD_KV.get(k.name, "json");
-    if (r && r.status === "open" && !isExpired(r)) items.push(r);
+  const arr = (await env.BOARD_KV.get(OPEN_IDX_KEY, "json")) || [];
+  const items = arr.filter(e => !entryExpired(e)).slice(0, 50);
+  if (items.length !== arr.length) {
+    await env.BOARD_KV.put(OPEN_IDX_KEY, JSON.stringify(items));
   }
-  items.sort((a, b) => b.createdAt - a.createdAt);
-  const SL = { open: ["报名中", "b-open"], confirmed: ["已约成", "b-confirmed"], completed: ["已完成", "b-completed"], expired: ["已过期", "b-expired"], cancelled: ["已取消", "b-cancelled"] };
   let body = "";
-  for (const r of items) {
-    const s = SL[r.status] || SL.open;
-    const d = esc(r.window.dateStart === r.window.dateEnd ? r.window.dateStart : r.window.dateStart + " ~ " + r.window.dateEnd);
-    const owner = await env.BOARD_KV.get("player:" + r.ownerId, "json");
-    body += `<div class="card"><a href="/r/${r.id}">
-      <div><b>${esc(r.region)}</b> · ${esc(r.court || "场地未定")}<span class="badge ${s[1]}">${s[0]}</span></div>
-      <div class="meta">${d} ${esc(r.window.timeStart)}-${esc(r.window.timeEnd)} · 缺 ${r.playersNeeded} 人 · ${esc(r.costShare)}</div>
-      <div class="dims">${ownerLine(publicPlayer(owner) || { name: r.ownerName, dims: r.ownerDims, stats: {} })}</div>
-      ${r.note ? `<div class="note">${esc(r.note)}</div>` : ""}
+  for (const e of items) {
+    const s = { open: ["报名中", "b-open"] };
+    const d = esc(e.window.dateStart === e.window.dateEnd ? e.window.dateStart : e.window.dateStart + " ~ " + e.window.dateEnd);
+    body += `<div class="card"><a href="/r/${e.id}">
+      <div><b>${esc(e.region)}</b> · ${esc(e.court || "场地未定")}<span class="badge ${s[1]}">${s[0]}</span></div>
+      <div class="meta">${d} ${esc(e.window.timeStart)}-${esc(e.window.timeEnd)} · 缺 ${e.playersNeeded} 人 · ${esc(e.costShare)}</div>
+      <div class="dims">${ownerLine(e.owner || {})}</div>
+      ${e.note ? `<div class="note">${esc(e.note)}</div>` : ""}
     </a></div>`;
   }
   if (!body) body = `<div class="card">公告板还是空的。装好约球 skill 的 agent 用户可以直接发布需求。</div>`;
   return html(`<h1>🎾 搭速约球公告板</h1><p class="sub">agent 自动约球的共享黑板 · 人类可读视图</p><p class="sub">水平分（满分 5）：${SCALE_HINT}</p>${body}`);
-}
-
-function copyTextFor(env, r) {
-  const url = new URL("/r/" + r.id, "http://placeholder").pathname;
-  return "我想打这个网球局，帮我约球：\n" +
-    "\u2460 安装约球 skill：" + skillSource(env) + "\n" +
-    "\u2461 然后对它说：报名球局 " + r.id + "\n" +
-    "（球局详情：" + "BOARD_URL_PLACEHOLDER" + url + "）";
 }
 
 async function detailPage(env, reqId) {

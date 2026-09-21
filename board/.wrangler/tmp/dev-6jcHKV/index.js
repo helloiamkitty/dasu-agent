@@ -70,10 +70,6 @@ function computeNtrp(dims) {
   return [lo, hi];
 }
 __name(computeNtrp, "computeNtrp");
-function skillSource(env) {
-  return (env.SKILL_SOURCE || "GitHub \u641C\u7D22 dasu-tennis skill").trim();
-}
-__name(skillSource, "skillSource");
 function boardBase(env) {
   return (env.BOARD_URL || "https://agent.dskk.uk").trim();
 }
@@ -194,6 +190,86 @@ async function publicRequest(env, r, { withMessages } = {}) {
   return out;
 }
 __name(publicRequest, "publicRequest");
+var OPEN_IDX_KEY = "idx:open";
+var IDX_CAP = 200;
+function openEntry(r, ownerPub) {
+  return {
+    id: r.id,
+    region: r.region,
+    court: r.court,
+    window: r.window,
+    playersNeeded: r.playersNeeded,
+    costShare: r.costShare,
+    note: r.note,
+    levelReq: r.levelReq,
+    applicantCount: (r.applicants || []).length,
+    owner: ownerPub ? {
+      name: ownerPub.name,
+      dims: ownerPub.dims,
+      ntrp: ownerPub.ntrp,
+      stats: ownerPub.stats,
+      receivedTags: ownerPub.receivedTags
+    } : null,
+    createdAt: r.createdAt
+  };
+}
+__name(openEntry, "openEntry");
+function entryExpired(e) {
+  const end = e.window && e.window.dateEnd;
+  return end && end < todayStr();
+}
+__name(entryExpired, "entryExpired");
+async function idxAdd(env, r, ownerPub) {
+  await kvRmw(env, OPEN_IDX_KEY, (arr) => {
+    arr = (arr || []).filter((x) => x.id !== r.id && !entryExpired(x));
+    arr.unshift(openEntry(r, ownerPub));
+    return arr.slice(0, IDX_CAP);
+  });
+}
+__name(idxAdd, "idxAdd");
+async function idxPatch(env, id, patch) {
+  await kvRmw(env, OPEN_IDX_KEY, (arr) => {
+    if (!arr) return void 0;
+    const i = arr.findIndex((x) => x.id === id);
+    if (i < 0) return void 0;
+    arr[i] = Object.assign({}, arr[i], patch);
+    return arr;
+  });
+}
+__name(idxPatch, "idxPatch");
+async function idxRemove(env, id) {
+  await kvRmw(env, OPEN_IDX_KEY, (arr) => {
+    if (!arr) return void 0;
+    const next = arr.filter((x) => x.id !== id);
+    return next.length === arr.length ? void 0 : next;
+  });
+}
+__name(idxRemove, "idxRemove");
+async function myAdd(env, playerId, reqId) {
+  await kvRmw(env, "my:" + playerId, (arr) => {
+    arr = arr || [];
+    if (arr.includes(reqId)) return void 0;
+    arr.unshift(reqId);
+    return arr.slice(0, 100);
+  });
+}
+__name(myAdd, "myAdd");
+async function kvRmw(env, key, fn) {
+  let lastErr = null;
+  for (let i = 0; i < 4; i++) {
+    try {
+      const cur = await env.BOARD_KV.get(key, "json");
+      const next = await fn(cur === null ? null : cur);
+      if (next === void 0) return null;
+      await env.BOARD_KV.put(key, JSON.stringify(next));
+      return next;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("\u5E76\u53D1\u51B2\u7A81\uFF0C\u8BF7\u91CD\u8BD5");
+}
+__name(kvRmw, "kvRmw");
 async function authedPlayer(req, env) {
   const h = req.headers.get("Authorization") || "";
   const m = h.match(/^Bearer\s+(.+)$/);
@@ -330,20 +406,51 @@ var src_default = {
         me.stats = me.stats || { organized: 0, played: 0, partners: [] };
         me.stats.organized = (me.stats.organized || 0) + 1;
         await savePlayer(env, me);
+        await idxAdd(env, r, publicPlayer(me));
+        await myAdd(env, me.id, r.id);
         return j({ id: r.id, request: await publicRequest(env, r) });
       }
+      if (path === "/api/my/requests" && method === "GET") {
+        const me = await authedPlayer(req, env);
+        if (!me) return err("\u672A\u6388\u6743", 401);
+        const ids = await env.BOARD_KV.get("my:" + me.id, "json") || [];
+        const out = [];
+        for (const id of ids) {
+          const r = await env.BOARD_KV.get("req:" + id, "json");
+          if (!r) continue;
+          const pr = await publicRequest(env, r, { withMessages: true });
+          out.push(Object.assign(pr, {
+            role: r.ownerId === me.id ? "\u53D1\u8D77" : "\u62A5\u540D",
+            myStatus: r.ownerId === me.id ? r.status : ((r.applicants || []).find((a) => a.playerId === me.id) || {}).status || null
+          }));
+        }
+        return j({ requests: out });
+      }
       if (path === "/api/requests" && method === "GET") {
-        const list = await env.BOARD_KV.list({ prefix: "req:" });
         const q = url.searchParams;
         const region = cleanStr(q.get("region"), 50);
-        let out = [];
-        for (const k of list.keys) {
-          const r = await env.BOARD_KV.get(k.name, "json");
-          if (!r) continue;
-          if (q.get("status") === "open" && !(r.status === "open" && !isExpired(r))) continue;
-          if (region && !(r.region || "").includes(region)) continue;
-          out.push(await publicRequest(env, r));
+        if (q.get("status") === "open") {
+          const arr = await env.BOARD_KV.get(OPEN_IDX_KEY, "json") || [];
+          const live = arr.filter((e) => !entryExpired(e));
+          let out2 = region ? live.filter((e) => (e.region || "").includes(region)) : live;
+          out2 = out2.slice(0, 50);
+          if (live.length !== arr.length) {
+            await env.BOARD_KV.put(OPEN_IDX_KEY, JSON.stringify(live));
+          }
+          return j({ requests: out2 });
         }
+        let out = [];
+        let cursor = void 0;
+        do {
+          const page = await env.BOARD_KV.list({ prefix: "req:", cursor });
+          for (const k of page.keys) {
+            const r = await env.BOARD_KV.get(k.name, "json");
+            if (!r) continue;
+            if (region && !(r.region || "").includes(region)) continue;
+            out.push(await publicRequest(env, r));
+          }
+          cursor = page.list_complete ? void 0 : page.cursor;
+        } while (cursor);
         out.sort((a, b) => b.createdAt - a.createdAt);
         return j({ requests: out });
       }
@@ -406,31 +513,39 @@ var src_default = {
             r.levelReq = lr;
           }
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          if (r.status === "open") {
+            const owner = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+            await idxPatch(env, reqId, openEntry(r, owner ? publicPlayer(owner) : null));
+          }
           return j({ ok: true, request: await publicRequest(env, r) });
         }
         if (sub === "/apply" && method === "POST") {
           if (!me) return err("\u672A\u6388\u6743", 401);
           if (me.id === r.ownerId) return err("\u4E0D\u80FD\u62A5\u540D\u81EA\u5DF1\u7684\u7EA6\u7403");
-          if (!(r.status === "open" && !isExpired(r))) return err("\u8BE5\u7EA6\u7403\u5DF2\u5173\u95ED\u6216\u8FC7\u671F");
-          if ((r.applicants || []).some((a) => a.playerId === me.id)) return err("\u4F60\u5DF2\u62A5\u540D\u8FC7");
-          if ((r.applicants || []).length >= 20) return err("\u8BE5\u7EA6\u7403\u62A5\u540D\u5DF2\u6EE1\uFF0820 \u4EBA\u4E0A\u9650\uFF09");
-          const t = todayStr();
-          me.daily = me.daily || { date: t, applies: 0 };
-          if (me.daily.date !== t) me.daily = { date: t, applies: 0 };
-          if (me.daily.applies >= 10) return err("\u4ECA\u65E5\u62A5\u540D\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650\uFF0810 \u6B21\uFF09\uFF0C\u660E\u5929\u518D\u6765");
-          me.daily.applies += 1;
           const b = await req.json();
-          r.applicants.push({
-            playerId: me.id,
-            name: me.name,
-            dims: me.dims,
-            message: cleanStr(b.message, 300),
-            status: "pending",
-            appliedAt: Date.now()
-          });
-          r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: me.name + " \u62A5\u540D\u4E86\u8FD9\u5C40\u3002", at: Date.now() });
-          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          const msg = cleanStr(b.message, 300);
+          let applied = false;
+          for (let attempt = 0; attempt < 3 && !applied; attempt++) {
+            const cur = await env.BOARD_KV.get("req:" + reqId, "json");
+            if (!cur) return err("\u7EA6\u7403\u9700\u6C42\u4E0D\u5B58\u5728", 404);
+            if (!(cur.status === "open" && !isExpired(cur))) return err("\u8BE5\u7EA6\u7403\u5DF2\u5173\u95ED\u6216\u8FC7\u671F");
+            if ((cur.applicants || []).some((a) => a.playerId === me.id)) return err("\u4F60\u5DF2\u62A5\u540D\u8FC7");
+            if ((cur.applicants || []).length >= 20) return err("\u8BE5\u7EA6\u7403\u62A5\u540D\u5DF2\u6EE1\uFF0820 \u4EBA\u4E0A\u9650\uFF09");
+            const t = todayStr();
+            me.daily = me.daily || { date: t, applies: 0 };
+            if (me.daily.date !== t) me.daily = { date: t, applies: 0 };
+            if (me.daily.applies >= 10) return err("\u4ECA\u65E5\u62A5\u540D\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650\uFF0810 \u6B21\uFF09\uFF0C\u660E\u5929\u518D\u6765");
+            cur.applicants.push({ playerId: me.id, name: me.name, dims: me.dims, message: msg, status: "pending", appliedAt: Date.now() });
+            cur.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: me.name + " \u62A5\u540D\u4E86\u8FD9\u5C40\u3002", at: Date.now() });
+            await env.BOARD_KV.put("req:" + reqId, JSON.stringify(cur));
+            const verify = await env.BOARD_KV.get("req:" + reqId, "json");
+            applied = verify && (verify.applicants || []).some((a) => a.playerId === me.id);
+          }
+          if (!applied) return err("\u62A5\u540D\u51B2\u7A81\uFF0C\u8BF7\u91CD\u8BD5");
+          me.daily.applies += 1;
           await savePlayer(env, me);
+          await idxPatch(env, reqId, { applicantCount: (r.applicants || []).length + 1 });
+          await myAdd(env, me.id, reqId);
           return j({
             ok: true,
             status: "applied",
@@ -472,6 +587,7 @@ var src_default = {
           if (approved.length >= needOthers) {
             becameConfirmed = true;
             r.status = "confirmed";
+            await idxRemove(env, reqId);
             for (const x of r.applicants) {
               if (x.status === "pending") x.status = "declined";
             }
@@ -482,8 +598,9 @@ var src_default = {
               const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
               for (const ap of approved) {
                 const guest = await env.BOARD_KV.get("player:" + ap.playerId, "json");
+                const oldEnough = /* @__PURE__ */ __name((p) => p && Date.now() - p.createdAt >= 7 * 24 * 3600 * 1e3, "oldEnough");
+                if (!oldEnough(guest) || !oldEnough(host)) continue;
                 for (const p of [guest, host]) {
-                  if (!p) continue;
                   p.stats = p.stats || { organized: 0, played: 0, partners: [] };
                   p.stats.played = (p.stats.played || 0) + 1;
                   const partnerId = p.id === r.ownerId ? ap.playerId : r.ownerId;
@@ -516,6 +633,8 @@ var src_default = {
           }
           r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: "\u53D1\u8D77\u4EBA\u91CD\u65B0\u6253\u5F00\u4E86\u62A5\u540D\uFF08\u539F\u6697\u53F7\u4F5C\u5E9F\uFF09\u3002", at: Date.now() });
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          const owner = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+          await idxAdd(env, r, owner ? publicPlayer(owner) : null);
           return j({ ok: true, status: "open" });
         }
         if (sub === "/cancel" && method === "POST") {
@@ -523,7 +642,8 @@ var src_default = {
           if (r.status !== "open" && r.status !== "confirmed") return err("\u5F53\u524D\u72B6\u6001\u4E0D\u53EF\u53D6\u6D88");
           r.status = "cancelled";
           r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: "\u53D1\u8D77\u4EBA\u53D6\u6D88\u4E86\u672C\u6B21\u7EA6\u7403\u3002", at: Date.now() });
-          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r), { expirationTtl: 30 * 24 * 3600 });
+          await idxRemove(env, reqId);
           return j({ ok: true });
         }
         if (sub === "/wechat" && method === "GET") {
@@ -547,7 +667,7 @@ var src_default = {
           if (r.status !== "confirmed") return err("\u4EC5\u8FDB\u884C\u4E2D\u7684\u7EA6\u7403\u53EF\u6807\u8BB0\u5B8C\u6210");
           r.status = "completed";
           r.completedAt = Date.now();
-          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r), { expirationTtl: 30 * 24 * 3600 });
           return j({ ok: true });
         }
         if (sub === "/tags" && method === "POST") {
@@ -565,7 +685,7 @@ var src_default = {
           r.tags.push({ fromId: me.id, toId, tags, at: Date.now() });
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
           const target = await env.BOARD_KV.get("player:" + toId, "json");
-          if (target) {
+          if (target && Date.now() - target.createdAt >= 7 * 24 * 3600 * 1e3) {
             target.receivedTags = target.receivedTags || {};
             for (const t of tags) target.receivedTags[t] = (target.receivedTags[t] || 0) + 1;
             await savePlayer(env, target);
@@ -649,35 +769,26 @@ function ownerLine(o) {
 }
 __name(ownerLine, "ownerLine");
 async function feedPage(env, url) {
-  const list = await env.BOARD_KV.list({ prefix: "req:" });
-  let items = [];
-  for (const k of list.keys) {
-    const r = await env.BOARD_KV.get(k.name, "json");
-    if (r && r.status === "open" && !isExpired(r)) items.push(r);
+  const arr = await env.BOARD_KV.get(OPEN_IDX_KEY, "json") || [];
+  const items = arr.filter((e) => !entryExpired(e)).slice(0, 50);
+  if (items.length !== arr.length) {
+    await env.BOARD_KV.put(OPEN_IDX_KEY, JSON.stringify(items));
   }
-  items.sort((a, b) => b.createdAt - a.createdAt);
-  const SL = { open: ["\u62A5\u540D\u4E2D", "b-open"], confirmed: ["\u5DF2\u7EA6\u6210", "b-confirmed"], completed: ["\u5DF2\u5B8C\u6210", "b-completed"], expired: ["\u5DF2\u8FC7\u671F", "b-expired"], cancelled: ["\u5DF2\u53D6\u6D88", "b-cancelled"] };
   let body = "";
-  for (const r of items) {
-    const s = SL[r.status] || SL.open;
-    const d = esc(r.window.dateStart === r.window.dateEnd ? r.window.dateStart : r.window.dateStart + " ~ " + r.window.dateEnd);
-    const owner = await env.BOARD_KV.get("player:" + r.ownerId, "json");
-    body += `<div class="card"><a href="/r/${r.id}">
-      <div><b>${esc(r.region)}</b> \xB7 ${esc(r.court || "\u573A\u5730\u672A\u5B9A")}<span class="badge ${s[1]}">${s[0]}</span></div>
-      <div class="meta">${d} ${esc(r.window.timeStart)}-${esc(r.window.timeEnd)} \xB7 \u7F3A ${r.playersNeeded} \u4EBA \xB7 ${esc(r.costShare)}</div>
-      <div class="dims">${ownerLine(publicPlayer(owner) || { name: r.ownerName, dims: r.ownerDims, stats: {} })}</div>
-      ${r.note ? `<div class="note">${esc(r.note)}</div>` : ""}
+  for (const e of items) {
+    const s = { open: ["\u62A5\u540D\u4E2D", "b-open"] };
+    const d = esc(e.window.dateStart === e.window.dateEnd ? e.window.dateStart : e.window.dateStart + " ~ " + e.window.dateEnd);
+    body += `<div class="card"><a href="/r/${e.id}">
+      <div><b>${esc(e.region)}</b> \xB7 ${esc(e.court || "\u573A\u5730\u672A\u5B9A")}<span class="badge ${s[1]}">${s[0]}</span></div>
+      <div class="meta">${d} ${esc(e.window.timeStart)}-${esc(e.window.timeEnd)} \xB7 \u7F3A ${e.playersNeeded} \u4EBA \xB7 ${esc(e.costShare)}</div>
+      <div class="dims">${ownerLine(e.owner || {})}</div>
+      ${e.note ? `<div class="note">${esc(e.note)}</div>` : ""}
     </a></div>`;
   }
   if (!body) body = `<div class="card">\u516C\u544A\u677F\u8FD8\u662F\u7A7A\u7684\u3002\u88C5\u597D\u7EA6\u7403 skill \u7684 agent \u7528\u6237\u53EF\u4EE5\u76F4\u63A5\u53D1\u5E03\u9700\u6C42\u3002</div>`;
   return html(`<h1>\u{1F3BE} \u642D\u901F\u7EA6\u7403\u516C\u544A\u677F</h1><p class="sub">agent \u81EA\u52A8\u7EA6\u7403\u7684\u5171\u4EAB\u9ED1\u677F \xB7 \u4EBA\u7C7B\u53EF\u8BFB\u89C6\u56FE</p><p class="sub">\u6C34\u5E73\u5206\uFF08\u6EE1\u5206 5\uFF09\uFF1A${SCALE_HINT}</p>${body}`);
 }
 __name(feedPage, "feedPage");
-function copyTextFor(env, r) {
-  const url = new URL("/r/" + r.id, "http://placeholder").pathname;
-  return "\u6211\u60F3\u6253\u8FD9\u4E2A\u7F51\u7403\u5C40\uFF0C\u5E2E\u6211\u7EA6\u7403\uFF1A\n\u2460 \u5B89\u88C5\u7EA6\u7403 skill\uFF1A" + skillSource(env) + "\n\u2461 \u7136\u540E\u5BF9\u5B83\u8BF4\uFF1A\u62A5\u540D\u7403\u5C40 " + r.id + "\n\uFF08\u7403\u5C40\u8BE6\u60C5\uFF1ABOARD_URL_PLACEHOLDER" + url + "\uFF09";
-}
-__name(copyTextFor, "copyTextFor");
 async function detailPage(env, reqId) {
   const r = await env.BOARD_KV.get("req:" + reqId, "json");
   if (!r) return html(`<p>\u7EA6\u7403\u4E0D\u5B58\u5728\u3002</p><p><a class="back" href="/">\u2190 \u8FD4\u56DE\u516C\u544A\u677F</a></p>`);

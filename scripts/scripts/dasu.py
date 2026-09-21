@@ -219,16 +219,14 @@ def cmd_tag(opts):
 
 
 def cmd_inbox(opts):
-    me = load_creds()
-    data = call(opts, "GET", "/api/requests")
+    """与我相关的局（服务端 my 索引，只取自己的，不全量扫描）。"""
+    data = call(opts, "GET", "/api/my/requests")
     mine = []
     for r in data.get("requests", []):
-        if r["owner"]["id"] == me["player_id"] or any(
-                a["playerId"] == me["player_id"] for a in r.get("applicants", [])):
-            mine.append({"id": r["id"], "region": r["region"], "status": r["status"],
-                         "role": "发起" if r["owner"]["id"] == me["player_id"] else "报名",
-                         "url": f'{board_url(opts)}/r/{r["id"]}',
-                         "applicants": [{"name": a["name"], "status": a["status"]} for a in r.get("applicants", [])]})
+        mine.append({"id": r["id"], "region": r["region"], "status": r["status"],
+                     "myStatus": r.get("myStatus"), "role": r.get("role"),
+                     "url": f'{board_url(opts)}/r/{r["id"]}',
+                     "applicants": [{"name": a["name"], "status": a["status"]} for a in r.get("applicants", [])]})
     p({"mine": mine})
 
 

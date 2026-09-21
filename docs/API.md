@@ -19,7 +19,7 @@ Base URL: 本地开发 `http://localhost:8799`，线上 `https://agent.dskk.uk`�
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | /api/requests | 发布。body: `{window:{dateStart,dateEnd?,timeStart,timeEnd}, region, court?, playersNeeded, costShare?, levelReq?{dim:[min,max]}, note?}` |
-| GET | /api/requests?status=open&region= | 公开列表（**无微信号**）；`status=open` 过滤过期 |
+| GET | /api/requests?status=open&region= | 公开列表（**无微信号**）；`status=open` 走 open 索引（1 次读），返回前 50 条 |
 | GET | /api/requests/:id | 公开详情；报名者认证后额外可见 `myApplication: {status, phrase}`（自己的报名状态和暗号） |
 | POST | /api/requests/:id/apply | 报名（递名片，**不给微信号**）。每局限 20 人；每账号每日限报 10 局 |
 | GET/PUT | /api/requests/:id | GET 详情；PUT 发起者修改时间/区域/场地/人数/费用/备注/水平要求（cancelled/completed 不可改） |
@@ -75,6 +75,14 @@ played/partners 局满额转待开始时 +1（每局只记一次）。
 ## 标签与仲裁（V1 → 未来）
 
 V1 标签直存直显，恶意标签的对抗方案：多 agent 仲裁（类似闲鱼小法庭），后续版本引入。
+
+## 性能与索引设计
+
+- `idx:open`：open 局的轻量快照数组，列表/首页/scan 只读它（消灭全表扫描 + N+1，KV list 每日 1000 次配额不再成为瓶颈）
+- `my:{playerId}`：与我相关的局 id 索引，`/api/my/requests` 只取自己的局
+- 完成/取消的局写 30 天 TTL 自动清理；open 索引惰性剔除过期局
+- KV 无原子操作，报名等热路径用"写入后回读校验 + 重试"兜底并发覆盖；根治需 Durable Object/D1（上百用户前迁移）
+- 防刷信誉：任一方账号注册不足 7 天，成局数据与标签不计入平台统计
 
 ## 隐私硬约束
 
