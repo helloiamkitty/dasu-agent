@@ -1,7 +1,8 @@
 // dasu-agent 公告板：agent 约球的共享黑板
 // 设计原则：
 // 1. 只做存取与状态流转，匹配判断在 agent 侧
-// 2. 微信号加密存储，任何列表/详情接口不返回；双方确认后仅对当事双方释放一次
+// 2. 微信号仅存服务端（KV 静态加密），任何列表/详情接口不返回；
+//    发起人"通过"报名者后才可获取，且每人限一次；通过时附带暗号，加好友凭暗号识别
 // 3. 水平分 4 维 1-5 分，来自入场问卷（自评），不据此仲裁
 // 4. 赛后 24 小时内可给对方打标签（V1 直存，未来引入多 agent 仲裁）
 // 5. 平台数据积累：发起场数、成局场数、约过的不同球友数、收到的标签
@@ -66,6 +67,15 @@ const TAG_LIMIT = 5;        // 每次最多打几个标签
 const TAG_MAX_LEN = 10;     // 单个标签最长字数
 const TAG_WINDOW_MS = 24 * 3600 * 1000; // 赛后 24 小时内可打标签
 
+// ---------- 暗号 ----------
+const PHRASE_A = ["上旋", "下旋", "平击", "切削", "截击", "高压", "放短", "挑高", "外角", "内角"];
+const PHRASE_B = ["小猫", "海豚", "火箭", "闪电", "咖啡", "早茶", "山竹", "晚霞", "球鞋", "西瓜"];
+function genPhrase() {
+  const r = new Uint8Array(3);
+  crypto.getRandomValues(r);
+  return PHRASE_A[r[0] % PHRASE_A.length] + PHRASE_B[r[1] % PHRASE_B.length] + (r[2] % 9 + 1);
+}
+
 // ---------- 工具 ----------
 
 function uuid() { return crypto.randomUUID(); }
@@ -77,7 +87,8 @@ function token() {
 }
 
 function todayStr() {
-  return new Date().toLocaleDateString("sv-SE"); // YYYY-MM-DD（本地时区）
+  // 东八区日期（用户均在国内），否则过期边界会偏移 8 小时
+  return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
 }
 
 function j(obj, status) {
@@ -259,6 +270,7 @@ export default {
         const timeStart = cleanStr(w.timeStart, 5);
         const timeEnd = cleanStr(w.timeEnd, 5);
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStart)) return err("window.dateStart 需为 YYYY-MM-DD");
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateEnd)) return err("window.dateEnd 需为 YYYY-MM-DD");
         if (dateEnd < dateStart) return err("dateEnd 不能早于 dateStart");
         if (!/^\d{2}:\d{2}$/.test(timeStart) || !/^\d{2}:\d{2}$/.test(timeEnd)) return err("window.timeStart/timeEnd 需为 HH:MM");
         const playersNeeded = parseInt(b.playersNeeded);
@@ -318,14 +330,22 @@ export default {
         const r = await env.BOARD_KV.get("req:" + reqId, "json");
         if (!r) return err("约球需求不存在", 404);
         const sub = rm[2] || "";
-        const me = ["", "/apply", "/messages", "/decide", "/reopen", "/cancel", "/complete", "/tags", "/wechat"].includes(sub)
+        const me = ["", "/apply", "/messages", "/approve", "/decline", "/reopen", "/cancel", "/complete", "/tags", "/wechat"].includes(sub)
           ? await authedPlayer(req, env) : null;
         const isOwner = me && me.id === r.ownerId;
         const isParticipant = me && (me.id === r.ownerId || me.id === r.confirmedWith ||
           (r.applicants || []).some(a => a.playerId === me.id));
 
         if (sub === "" && method === "GET") {
-          return j({ request: await publicRequest(env, r, { withMessages: isParticipant }) });
+          const out = await publicRequest(env, r, { withMessages: isParticipant });
+          if (me) {
+            const a = (r.applicants || []).find(x => x.playerId === me.id);
+            if (a) {
+              const ap = (r.approvals || []).find(x => x.playerId === me.id);
+              out.myApplication = { status: a.status, phrase: ap ? ap.phrase : null };
+            }
+          }
+          return j({ request: out });
         }
 
         // 发起者更新约球信息（时间/区域/场地/人数/费用/备注/水平要求）
@@ -338,10 +358,13 @@ export default {
             const ds = cleanStr(w.dateStart, 10) || r.window.dateStart;
             const de = cleanStr(w.dateEnd, 10) || w.dateStart && ds || r.window.dateEnd;
             if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) return err("dateStart 需为 YYYY-MM-DD");
+            const de2 = de || ds;
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) return err("dateStart 需为 YYYY-MM-DD");
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(de2)) return err("dateEnd 需为 YYYY-MM-DD");
             const ts = cleanStr(w.timeStart, 5) || r.window.timeStart;
             const te = cleanStr(w.timeEnd, 5) || r.window.timeEnd;
             if (!/^\d{2}:\d{2}$/.test(ts) || !/^\d{2}:\d{2}$/.test(te)) return err("时间需为 HH:MM");
-            r.window = { dateStart: ds, dateEnd: de || ds, timeStart: ts, timeEnd: te };
+            r.window = { dateStart: ds, dateEnd: de2, timeStart: ts, timeEnd: te };
           }
           if (b.region !== undefined) r.region = cleanStr(b.region, 50) || r.region;
           if (b.court !== undefined) r.court = cleanStr(b.court, 80);
@@ -368,25 +391,30 @@ export default {
           return j({ ok: true, request: await publicRequest(env, r) });
         }
 
-        // 报名即拿号：当场返回发起人微信号；局仍保持 open（可多人报名），
-        // 发起人之后确定约球方（/decide）。先报后报都有号，选择权在发起人的微信沟通。
+        // 报名 = 递名片：写入报名记录，等待发起人通过。
+        // 发起人通过（/approve）后报名者才拿得到微信号，且附带暗号（加好友时识别用）。
         if (sub === "/apply" && method === "POST") {
           if (!me) return err("未授权", 401);
           if (me.id === r.ownerId) return err("不能报名自己的约球");
           if (!(r.status === "open" && !isExpired(r))) return err("该约球已关闭或过期");
           if ((r.applicants || []).some(a => a.playerId === me.id)) return err("你已报名过");
+          if ((r.applicants || []).length >= 20) return err("该约球报名已满（20 人上限）");
+          // 每账号每日报名上限（防批量薅号；正常球友一天报不了 10 局）
+          const t = todayStr();
+          me.daily = me.daily || { date: t, applies: 0 };
+          if (me.daily.date !== t) me.daily = { date: t, applies: 0 };
+          if (me.daily.applies >= 10) return err("今日报名次数已达上限（10 次），明天再来");
+          me.daily.applies += 1;
           const b = await req.json();
           r.applicants.push({
             playerId: me.id, name: me.name, dims: me.dims,
             message: cleanStr(b.message, 300), status: "pending", appliedAt: Date.now()
           });
-          r.messages.push({ from: "system", fromName: "系统", text: me.name + " 报名了这局（微信号已向其开放）。", at: Date.now() });
-          r.wxReleased[me.id] = Date.now();
+          r.messages.push({ from: "system", fromName: "系统", text: me.name + " 报名了这局。", at: Date.now() });
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-          const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+          await savePlayer(env, me);
           return j({ ok: true, status: "applied",
-                     wechatId: host && host.wechatId ? host.wechatId : null,
-                     note: "这是发起人的微信号（仅展示这一次，请立即保存）。细节请微信沟通；最终约球方由发起人确定。" });
+                     note: "已报名。发起人通过后你会拿到他的微信号和加好友暗号，你的 agent 会定期帮你盯结果。" });
         }
 
         if (sub === "/messages" && method === "POST") {
@@ -401,36 +429,66 @@ export default {
           return j({ ok: true });
         }
 
-        // 发起者确定约球方：open → confirmed（待开始）；其余待定报名者标记婉拒
-        if (sub === "/decide" && method === "POST") {
+        // 发起人通过报名者（可多选）：approved + 每人一个暗号；通过人数达到需求时局自动"待开始"
+        if (sub === "/approve" && method === "POST") {
           if (!isOwner) return err("仅发起者可操作", 403);
-          if (r.status !== "open") return err("当前状态不可确定约球方");
+          if (r.status !== "open") return err("当前状态不可通过报名者");
+          const b = await req.json();
+          const ids = Array.isArray(b.playerIds) ? b.playerIds : [b.playerId];
+          if (!ids.length || ids.length > 20) return err("playerIds 需为 1-20 个");
+          const customPhrase = cleanStr(b.phrase, 20); // 发起人可自定义统一暗号，否则每人一个随机暗号
+          const results = [];
+          for (const pid of ids) {
+            const a = (r.applicants || []).find(x => x.playerId === pid);
+            if (!a || a.status !== "pending") continue;
+            a.status = "approved";
+            const phrase = customPhrase || genPhrase();
+            r.approvals = r.approvals || [];
+            r.approvals.push({ playerId: pid, name: a.name, phrase, at: Date.now() });
+            results.push({ playerId: pid, name: a.name, phrase });
+          }
+          if (!results.length) return err("没有可通过的报名者（需为 pending 状态）");
+          const approved = r.applicants.filter(x => x.status === "approved");
+          const needOthers = Math.max(0, r.playersNeeded - 1);
+          let becameConfirmed = false;
+          if (approved.length >= needOthers) {
+            becameConfirmed = true;
+            r.status = "confirmed";
+            for (const x of r.applicants) {
+              if (x.status === "pending") x.status = "declined";
+            }
+            r.messages.push({ from: "system", fromName: "系统", text: "约球方已定（" + approved.map(x => x.name).join("、") + "）。状态：待开始。", at: Date.now() });
+            // 双方平台数据：成局 +1，互为约过球友（每局只累计一次）
+            if (r.statsCounted !== "done") {
+              r.statsCounted = "done";
+              await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+              const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+              for (const ap of approved) {
+                const guest = await env.BOARD_KV.get("player:" + ap.playerId, "json");
+                for (const p of [guest, host]) {
+                  if (!p) continue;
+                  p.stats = p.stats || { organized: 0, played: 0, partners: [] };
+                  p.stats.played = (p.stats.played || 0) + 1;
+                  const partnerId = p.id === r.ownerId ? ap.playerId : r.ownerId;
+                  if (!p.stats.partners.includes(partnerId)) p.stats.partners.push(partnerId);
+                  await savePlayer(env, p);
+                }
+              }
+            }
+          }
+          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          return j({ ok: true, approved: results, status: r.status, becameConfirmed });
+        }
+
+        // 发起人婉拒单个报名者
+        if (sub === "/decline" && method === "POST") {
+          if (!isOwner) return err("仅发起者可操作", 403);
           const b = await req.json();
           const a = (r.applicants || []).find(x => x.playerId === b.playerId);
           if (!a || a.status !== "pending") return err("该报名者不存在或已处理");
-          for (const x of r.applicants) {
-            if (x.status === "pending") x.status = x.playerId === a.playerId ? "confirmed" : "declined";
-          }
-          r.status = "confirmed";
-          r.confirmedWith = a.playerId;
-          r.messages.push({ from: "system", fromName: "系统", text: "约球方已定：" + a.name + "。状态：待开始。", at: Date.now() });
+          a.status = "declined";
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-          // 双方平台数据：成局 +1，互为约过球友（重开后重新定同一人不重复累计）
-          if (r.statsCounted !== a.playerId) {
-            r.statsCounted = a.playerId;
-            await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-            const guest = await env.BOARD_KV.get("player:" + a.playerId, "json");
-            const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
-            for (const p of [guest, host]) {
-              if (!p) continue;
-              p.stats = p.stats || { organized: 0, played: 0, partners: [] };
-              p.stats.played = (p.stats.played || 0) + 1;
-              const partnerId = p.id === r.ownerId ? a.playerId : r.ownerId;
-              if (!p.stats.partners.includes(partnerId)) p.stats.partners.push(partnerId);
-              await savePlayer(env, p);
-            }
-          }
-          return j({ ok: true, status: "confirmed" });
+          return j({ ok: true });
         }
 
         // 发起者重开报名（待开始 → 报名中），已定约球方回到待定，婉拒者保持婉拒
@@ -439,10 +497,11 @@ export default {
           if (r.status !== "confirmed") return err("仅待开始状态可重开报名");
           r.status = "open";
           r.confirmedWith = null;
+          r.approvals = [];
           for (const x of r.applicants) {
-            if (x.status === "confirmed") x.status = "pending";
+            if (x.status === "approved") x.status = "pending";
           }
-          r.messages.push({ from: "system", fromName: "系统", text: "发起人重新打开了报名。", at: Date.now() });
+          r.messages.push({ from: "system", fromName: "系统", text: "发起人重新打开了报名（原暗号作废）。", at: Date.now() });
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
           return j({ ok: true, status: "open" });
         }
@@ -457,18 +516,19 @@ export default {
           return j({ ok: true });
         }
 
+        // 被通过的报名者取发起人微信号（每人限一次）；暗号随详情里的"我的报名"一并返回
         if (sub === "/wechat" && method === "GET") {
           if (!me) return err("未授权", 401);
-          if (r.status !== "confirmed" && r.status !== "completed") return err("约球确认后才可获取微信号");
-          const isParty = me.id === r.ownerId || me.id === r.confirmedWith;
-          if (!isParty) return err("仅约成双方可获取", 403);
-          const otherId = me.id === r.ownerId ? r.confirmedWith : r.ownerId;
+          const a = (r.applicants || []).find(x => x.playerId === me.id);
+          if (!a || a.status !== "approved") return err("发起人通过你的报名后才能获取微信号", 403);
           if (r.wxReleased[me.id]) return err("微信号已释放过一次，请查看你 agent 的首次获取记录", 410);
-          const other = await env.BOARD_KV.get("player:" + otherId, "json");
-          if (!other || !other.wechatId) return err("对方未设置微信号");
+          const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+          if (!host || !host.wechatId) return err("对方未设置微信号");
           r.wxReleased[me.id] = Date.now();
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-          return j({ wechatId: other.wechatId, note: "仅释放这一次，请立即转给主人并妥善保存" });
+          const ap = (r.approvals || []).find(x => x.playerId === me.id);
+          return j({ wechatId: host.wechatId, phrase: ap ? ap.phrase : null,
+                     note: "微信号仅这一次。加好友时请发送你的暗号，对方凭暗号识别你。" });
         }
 
         if (sub === "/complete" && method === "POST") {
@@ -599,7 +659,7 @@ async function feedPage(env, url) {
   let body = "";
   for (const r of items) {
     const s = SL[r.status] || SL.open;
-    const d = r.window.dateStart === r.window.dateEnd ? r.window.dateStart : r.window.dateStart + " ~ " + r.window.dateEnd;
+    const d = esc(r.window.dateStart === r.window.dateEnd ? r.window.dateStart : r.window.dateStart + " ~ " + r.window.dateEnd);
     const owner = await env.BOARD_KV.get("player:" + r.ownerId, "json");
     body += `<div class="card"><a href="/r/${r.id}">
       <div><b>${esc(r.region)}</b> · ${esc(r.court || "场地未定")}<span class="badge ${s[1]}">${s[0]}</span></div>
@@ -627,7 +687,7 @@ async function detailPage(env, reqId) {
   const copyText = copyTextFor(env, r).replace(/BOARD_URL_PLACEHOLDER/g, "http://x").replace("http://x", boardBase(env));
   const SL = { open: ["报名中", "b-open"], confirmed: ["已约成", "b-confirmed"], completed: ["已完成", "b-completed"], expired: ["已过期", "b-expired"], cancelled: ["已取消", "b-cancelled"] };
   const s = SL[p.status] || SL.open;
-  const d = p.window.dateStart === p.window.dateEnd ? p.window.dateStart : p.window.dateStart + " ~ " + p.window.dateEnd;
+  const d = esc(p.window.dateStart === p.window.dateEnd ? p.window.dateStart : p.window.dateStart + " ~ " + p.window.dateEnd);
   const lr = Object.entries(p.levelReq || {}).map(([k, v]) => `${dimName(k)} ${fmt(v[0])}-${fmt(v[1])}`).join("，");
   return html(`<p><a class="back" href="/">← 返回公告板</a></p>
     <div class="card">

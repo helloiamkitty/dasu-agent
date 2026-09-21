@@ -110,9 +110,7 @@ def cmd_show(opts):
 
 def cmd_apply(opts):
     resp = call(opts, "POST", f"/api/requests/{opts.req_id}/apply", {"message": opts.message})
-    if resp.get("wechatId"):
-        print(f"发起人微信号：{resp['wechatId']}（仅展示这一次，请立即保存）")
-        print(f"说明：{resp.get('note', '')}")
+    print(resp.get("note", "已报名"))
     p(resp)
 
 
@@ -120,8 +118,15 @@ def cmd_msg(opts):
     p(call(opts, "POST", f"/api/requests/{opts.req_id}/messages", {"text": opts.text}))
 
 
-def cmd_decide(opts):
-    p(call(opts, "POST", f"/api/requests/{opts.req_id}/decide", {"playerId": opts.player}))
+def cmd_approve(opts):
+    body = {"playerIds": [x.strip() for x in opts.players.split(",") if x.strip()]}
+    if opts.phrase:
+        body["phrase"] = opts.phrase
+    p(call(opts, "POST", f"/api/requests/{opts.req_id}/approve", body))
+
+
+def cmd_decline(opts):
+    p(call(opts, "POST", f"/api/requests/{opts.req_id}/decline", {"playerId": opts.player}))
 
 
 def cmd_reopen(opts):
@@ -197,7 +202,11 @@ def cmd_scan(opts):
 
 
 def cmd_wechat(opts):
-    p(call(opts, "GET", f"/api/requests/{opts.req_id}/wechat"))
+    resp = call(opts, "GET", f"/api/requests/{opts.req_id}/wechat")
+    print(f"发起人微信号：{resp['wechatId']}（仅这一次，请立即保存）")
+    if resp.get("phrase"):
+        print(f"加好友暗号：{resp['phrase']}")
+    print(resp.get("note", ""))
 
 
 def cmd_complete(opts):
@@ -255,7 +264,10 @@ def main():
     s = sub.add_parser("show"); s.add_argument("req_id")
     s = sub.add_parser("apply"); s.add_argument("req_id"); s.add_argument("--message", required=True)
     s = sub.add_parser("msg"); s.add_argument("req_id"); s.add_argument("--text", required=True)
-    s = sub.add_parser("decide", help="确定约球方（报名中→待开始）"); s.add_argument("req_id"); s.add_argument("--player", required=True)
+    s = sub.add_parser("approve", help="通过报名者（可多选，逗号分隔）"); s.add_argument("req_id")
+    s.add_argument("--players", required=True, help="报名者 playerId，逗号分隔")
+    s.add_argument("--phrase", help="自定义统一暗号（默认每人随机生成）")
+    s = sub.add_parser("decline", help="婉拒报名者"); s.add_argument("req_id"); s.add_argument("--player", required=True)
     for name in ("reopen", "cancel", "wechat", "complete"):
         s = sub.add_parser(name); s.add_argument("req_id")
     s = sub.add_parser("edit", help="发起者修改约球信息")

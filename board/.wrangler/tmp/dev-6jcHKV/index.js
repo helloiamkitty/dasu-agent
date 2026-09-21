@@ -81,6 +81,14 @@ __name(boardBase, "boardBase");
 var TAG_LIMIT = 5;
 var TAG_MAX_LEN = 10;
 var TAG_WINDOW_MS = 24 * 3600 * 1e3;
+var PHRASE_A = ["\u4E0A\u65CB", "\u4E0B\u65CB", "\u5E73\u51FB", "\u5207\u524A", "\u622A\u51FB", "\u9AD8\u538B", "\u653E\u77ED", "\u6311\u9AD8", "\u5916\u89D2", "\u5185\u89D2"];
+var PHRASE_B = ["\u5C0F\u732B", "\u6D77\u8C5A", "\u706B\u7BAD", "\u95EA\u7535", "\u5496\u5561", "\u65E9\u8336", "\u5C71\u7AF9", "\u665A\u971E", "\u7403\u978B", "\u897F\u74DC"];
+function genPhrase() {
+  const r = new Uint8Array(3);
+  crypto.getRandomValues(r);
+  return PHRASE_A[r[0] % PHRASE_A.length] + PHRASE_B[r[1] % PHRASE_B.length] + (r[2] % 9 + 1);
+}
+__name(genPhrase, "genPhrase");
 function uuid() {
   return crypto.randomUUID();
 }
@@ -92,7 +100,7 @@ function token() {
 }
 __name(token, "token");
 function todayStr() {
-  return (/* @__PURE__ */ new Date()).toLocaleDateString("sv-SE");
+  return (/* @__PURE__ */ new Date()).toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
 }
 __name(todayStr, "todayStr");
 function j(obj, status) {
@@ -281,6 +289,7 @@ var src_default = {
         const timeStart = cleanStr(w.timeStart, 5);
         const timeEnd = cleanStr(w.timeEnd, 5);
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStart)) return err("window.dateStart \u9700\u4E3A YYYY-MM-DD");
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateEnd)) return err("window.dateEnd \u9700\u4E3A YYYY-MM-DD");
         if (dateEnd < dateStart) return err("dateEnd \u4E0D\u80FD\u65E9\u4E8E dateStart");
         if (!/^\d{2}:\d{2}$/.test(timeStart) || !/^\d{2}:\d{2}$/.test(timeEnd)) return err("window.timeStart/timeEnd \u9700\u4E3A HH:MM");
         const playersNeeded = parseInt(b.playersNeeded);
@@ -344,11 +353,19 @@ var src_default = {
         const r = await env.BOARD_KV.get("req:" + reqId, "json");
         if (!r) return err("\u7EA6\u7403\u9700\u6C42\u4E0D\u5B58\u5728", 404);
         const sub = rm[2] || "";
-        const me = ["", "/apply", "/messages", "/decide", "/reopen", "/cancel", "/complete", "/tags", "/wechat"].includes(sub) ? await authedPlayer(req, env) : null;
+        const me = ["", "/apply", "/messages", "/approve", "/decline", "/reopen", "/cancel", "/complete", "/tags", "/wechat"].includes(sub) ? await authedPlayer(req, env) : null;
         const isOwner = me && me.id === r.ownerId;
         const isParticipant = me && (me.id === r.ownerId || me.id === r.confirmedWith || (r.applicants || []).some((a) => a.playerId === me.id));
         if (sub === "" && method === "GET") {
-          return j({ request: await publicRequest(env, r, { withMessages: isParticipant }) });
+          const out = await publicRequest(env, r, { withMessages: isParticipant });
+          if (me) {
+            const a = (r.applicants || []).find((x) => x.playerId === me.id);
+            if (a) {
+              const ap = (r.approvals || []).find((x) => x.playerId === me.id);
+              out.myApplication = { status: a.status, phrase: ap ? ap.phrase : null };
+            }
+          }
+          return j({ request: out });
         }
         if (sub === "" && method === "PUT") {
           if (!isOwner) return err("\u4EC5\u53D1\u8D77\u8005\u53EF\u4FEE\u6539", 403);
@@ -359,10 +376,13 @@ var src_default = {
             const ds = cleanStr(w.dateStart, 10) || r.window.dateStart;
             const de = cleanStr(w.dateEnd, 10) || w.dateStart && ds || r.window.dateEnd;
             if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) return err("dateStart \u9700\u4E3A YYYY-MM-DD");
+            const de2 = de || ds;
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(ds)) return err("dateStart \u9700\u4E3A YYYY-MM-DD");
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(de2)) return err("dateEnd \u9700\u4E3A YYYY-MM-DD");
             const ts = cleanStr(w.timeStart, 5) || r.window.timeStart;
             const te = cleanStr(w.timeEnd, 5) || r.window.timeEnd;
             if (!/^\d{2}:\d{2}$/.test(ts) || !/^\d{2}:\d{2}$/.test(te)) return err("\u65F6\u95F4\u9700\u4E3A HH:MM");
-            r.window = { dateStart: ds, dateEnd: de || ds, timeStart: ts, timeEnd: te };
+            r.window = { dateStart: ds, dateEnd: de2, timeStart: ts, timeEnd: te };
           }
           if (b.region !== void 0) r.region = cleanStr(b.region, 50) || r.region;
           if (b.court !== void 0) r.court = cleanStr(b.court, 80);
@@ -393,6 +413,12 @@ var src_default = {
           if (me.id === r.ownerId) return err("\u4E0D\u80FD\u62A5\u540D\u81EA\u5DF1\u7684\u7EA6\u7403");
           if (!(r.status === "open" && !isExpired(r))) return err("\u8BE5\u7EA6\u7403\u5DF2\u5173\u95ED\u6216\u8FC7\u671F");
           if ((r.applicants || []).some((a) => a.playerId === me.id)) return err("\u4F60\u5DF2\u62A5\u540D\u8FC7");
+          if ((r.applicants || []).length >= 20) return err("\u8BE5\u7EA6\u7403\u62A5\u540D\u5DF2\u6EE1\uFF0820 \u4EBA\u4E0A\u9650\uFF09");
+          const t = todayStr();
+          me.daily = me.daily || { date: t, applies: 0 };
+          if (me.daily.date !== t) me.daily = { date: t, applies: 0 };
+          if (me.daily.applies >= 10) return err("\u4ECA\u65E5\u62A5\u540D\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650\uFF0810 \u6B21\uFF09\uFF0C\u660E\u5929\u518D\u6765");
+          me.daily.applies += 1;
           const b = await req.json();
           r.applicants.push({
             playerId: me.id,
@@ -402,15 +428,13 @@ var src_default = {
             status: "pending",
             appliedAt: Date.now()
           });
-          r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: me.name + " \u62A5\u540D\u4E86\u8FD9\u5C40\uFF08\u5FAE\u4FE1\u53F7\u5DF2\u5411\u5176\u5F00\u653E\uFF09\u3002", at: Date.now() });
-          r.wxReleased[me.id] = Date.now();
+          r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: me.name + " \u62A5\u540D\u4E86\u8FD9\u5C40\u3002", at: Date.now() });
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-          const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+          await savePlayer(env, me);
           return j({
             ok: true,
             status: "applied",
-            wechatId: host && host.wechatId ? host.wechatId : null,
-            note: "\u8FD9\u662F\u53D1\u8D77\u4EBA\u7684\u5FAE\u4FE1\u53F7\uFF08\u4EC5\u5C55\u793A\u8FD9\u4E00\u6B21\uFF0C\u8BF7\u7ACB\u5373\u4FDD\u5B58\uFF09\u3002\u7EC6\u8282\u8BF7\u5FAE\u4FE1\u6C9F\u901A\uFF1B\u6700\u7EC8\u7EA6\u7403\u65B9\u7531\u53D1\u8D77\u4EBA\u786E\u5B9A\u3002"
+            note: "\u5DF2\u62A5\u540D\u3002\u53D1\u8D77\u4EBA\u901A\u8FC7\u540E\u4F60\u4F1A\u62FF\u5230\u4ED6\u7684\u5FAE\u4FE1\u53F7\u548C\u52A0\u597D\u53CB\u6697\u53F7\uFF0C\u4F60\u7684 agent \u4F1A\u5B9A\u671F\u5E2E\u4F60\u76EF\u7ED3\u679C\u3002"
           });
         }
         if (sub === "/messages" && method === "POST") {
@@ -424,44 +448,73 @@ var src_default = {
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
           return j({ ok: true });
         }
-        if (sub === "/decide" && method === "POST") {
+        if (sub === "/approve" && method === "POST") {
           if (!isOwner) return err("\u4EC5\u53D1\u8D77\u8005\u53EF\u64CD\u4F5C", 403);
-          if (r.status !== "open") return err("\u5F53\u524D\u72B6\u6001\u4E0D\u53EF\u786E\u5B9A\u7EA6\u7403\u65B9");
+          if (r.status !== "open") return err("\u5F53\u524D\u72B6\u6001\u4E0D\u53EF\u901A\u8FC7\u62A5\u540D\u8005");
+          const b = await req.json();
+          const ids = Array.isArray(b.playerIds) ? b.playerIds : [b.playerId];
+          if (!ids.length || ids.length > 20) return err("playerIds \u9700\u4E3A 1-20 \u4E2A");
+          const customPhrase = cleanStr(b.phrase, 20);
+          const results = [];
+          for (const pid of ids) {
+            const a = (r.applicants || []).find((x) => x.playerId === pid);
+            if (!a || a.status !== "pending") continue;
+            a.status = "approved";
+            const phrase = customPhrase || genPhrase();
+            r.approvals = r.approvals || [];
+            r.approvals.push({ playerId: pid, name: a.name, phrase, at: Date.now() });
+            results.push({ playerId: pid, name: a.name, phrase });
+          }
+          if (!results.length) return err("\u6CA1\u6709\u53EF\u901A\u8FC7\u7684\u62A5\u540D\u8005\uFF08\u9700\u4E3A pending \u72B6\u6001\uFF09");
+          const approved = r.applicants.filter((x) => x.status === "approved");
+          const needOthers = Math.max(0, r.playersNeeded - 1);
+          let becameConfirmed = false;
+          if (approved.length >= needOthers) {
+            becameConfirmed = true;
+            r.status = "confirmed";
+            for (const x of r.applicants) {
+              if (x.status === "pending") x.status = "declined";
+            }
+            r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: "\u7EA6\u7403\u65B9\u5DF2\u5B9A\uFF08" + approved.map((x) => x.name).join("\u3001") + "\uFF09\u3002\u72B6\u6001\uFF1A\u5F85\u5F00\u59CB\u3002", at: Date.now() });
+            if (r.statsCounted !== "done") {
+              r.statsCounted = "done";
+              await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+              const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+              for (const ap of approved) {
+                const guest = await env.BOARD_KV.get("player:" + ap.playerId, "json");
+                for (const p of [guest, host]) {
+                  if (!p) continue;
+                  p.stats = p.stats || { organized: 0, played: 0, partners: [] };
+                  p.stats.played = (p.stats.played || 0) + 1;
+                  const partnerId = p.id === r.ownerId ? ap.playerId : r.ownerId;
+                  if (!p.stats.partners.includes(partnerId)) p.stats.partners.push(partnerId);
+                  await savePlayer(env, p);
+                }
+              }
+            }
+          }
+          await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
+          return j({ ok: true, approved: results, status: r.status, becameConfirmed });
+        }
+        if (sub === "/decline" && method === "POST") {
+          if (!isOwner) return err("\u4EC5\u53D1\u8D77\u8005\u53EF\u64CD\u4F5C", 403);
           const b = await req.json();
           const a = (r.applicants || []).find((x) => x.playerId === b.playerId);
           if (!a || a.status !== "pending") return err("\u8BE5\u62A5\u540D\u8005\u4E0D\u5B58\u5728\u6216\u5DF2\u5904\u7406");
-          for (const x of r.applicants) {
-            if (x.status === "pending") x.status = x.playerId === a.playerId ? "confirmed" : "declined";
-          }
-          r.status = "confirmed";
-          r.confirmedWith = a.playerId;
-          r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: "\u7EA6\u7403\u65B9\u5DF2\u5B9A\uFF1A" + a.name + "\u3002\u72B6\u6001\uFF1A\u5F85\u5F00\u59CB\u3002", at: Date.now() });
+          a.status = "declined";
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-          if (r.statsCounted !== a.playerId) {
-            r.statsCounted = a.playerId;
-            await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-            const guest = await env.BOARD_KV.get("player:" + a.playerId, "json");
-            const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
-            for (const p of [guest, host]) {
-              if (!p) continue;
-              p.stats = p.stats || { organized: 0, played: 0, partners: [] };
-              p.stats.played = (p.stats.played || 0) + 1;
-              const partnerId = p.id === r.ownerId ? a.playerId : r.ownerId;
-              if (!p.stats.partners.includes(partnerId)) p.stats.partners.push(partnerId);
-              await savePlayer(env, p);
-            }
-          }
-          return j({ ok: true, status: "confirmed" });
+          return j({ ok: true });
         }
         if (sub === "/reopen" && method === "POST") {
           if (!isOwner) return err("\u4EC5\u53D1\u8D77\u8005\u53EF\u64CD\u4F5C", 403);
           if (r.status !== "confirmed") return err("\u4EC5\u5F85\u5F00\u59CB\u72B6\u6001\u53EF\u91CD\u5F00\u62A5\u540D");
           r.status = "open";
           r.confirmedWith = null;
+          r.approvals = [];
           for (const x of r.applicants) {
-            if (x.status === "confirmed") x.status = "pending";
+            if (x.status === "approved") x.status = "pending";
           }
-          r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: "\u53D1\u8D77\u4EBA\u91CD\u65B0\u6253\u5F00\u4E86\u62A5\u540D\u3002", at: Date.now() });
+          r.messages.push({ from: "system", fromName: "\u7CFB\u7EDF", text: "\u53D1\u8D77\u4EBA\u91CD\u65B0\u6253\u5F00\u4E86\u62A5\u540D\uFF08\u539F\u6697\u53F7\u4F5C\u5E9F\uFF09\u3002", at: Date.now() });
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
           return j({ ok: true, status: "open" });
         }
@@ -475,16 +528,19 @@ var src_default = {
         }
         if (sub === "/wechat" && method === "GET") {
           if (!me) return err("\u672A\u6388\u6743", 401);
-          if (r.status !== "confirmed" && r.status !== "completed") return err("\u7EA6\u7403\u786E\u8BA4\u540E\u624D\u53EF\u83B7\u53D6\u5FAE\u4FE1\u53F7");
-          const isParty = me.id === r.ownerId || me.id === r.confirmedWith;
-          if (!isParty) return err("\u4EC5\u7EA6\u6210\u53CC\u65B9\u53EF\u83B7\u53D6", 403);
-          const otherId = me.id === r.ownerId ? r.confirmedWith : r.ownerId;
+          const a = (r.applicants || []).find((x) => x.playerId === me.id);
+          if (!a || a.status !== "approved") return err("\u53D1\u8D77\u4EBA\u901A\u8FC7\u4F60\u7684\u62A5\u540D\u540E\u624D\u80FD\u83B7\u53D6\u5FAE\u4FE1\u53F7", 403);
           if (r.wxReleased[me.id]) return err("\u5FAE\u4FE1\u53F7\u5DF2\u91CA\u653E\u8FC7\u4E00\u6B21\uFF0C\u8BF7\u67E5\u770B\u4F60 agent \u7684\u9996\u6B21\u83B7\u53D6\u8BB0\u5F55", 410);
-          const other = await env.BOARD_KV.get("player:" + otherId, "json");
-          if (!other || !other.wechatId) return err("\u5BF9\u65B9\u672A\u8BBE\u7F6E\u5FAE\u4FE1\u53F7");
+          const host = await env.BOARD_KV.get("player:" + r.ownerId, "json");
+          if (!host || !host.wechatId) return err("\u5BF9\u65B9\u672A\u8BBE\u7F6E\u5FAE\u4FE1\u53F7");
           r.wxReleased[me.id] = Date.now();
           await env.BOARD_KV.put("req:" + reqId, JSON.stringify(r));
-          return j({ wechatId: other.wechatId, note: "\u4EC5\u91CA\u653E\u8FD9\u4E00\u6B21\uFF0C\u8BF7\u7ACB\u5373\u8F6C\u7ED9\u4E3B\u4EBA\u5E76\u59A5\u5584\u4FDD\u5B58" });
+          const ap = (r.approvals || []).find((x) => x.playerId === me.id);
+          return j({
+            wechatId: host.wechatId,
+            phrase: ap ? ap.phrase : null,
+            note: "\u5FAE\u4FE1\u53F7\u4EC5\u8FD9\u4E00\u6B21\u3002\u52A0\u597D\u53CB\u65F6\u8BF7\u53D1\u9001\u4F60\u7684\u6697\u53F7\uFF0C\u5BF9\u65B9\u51ED\u6697\u53F7\u8BC6\u522B\u4F60\u3002"
+          });
         }
         if (sub === "/complete" && method === "POST") {
           if (!isOwner) return err("\u4EC5\u53D1\u8D77\u8005\u53EF\u64CD\u4F5C", 403);
@@ -604,7 +660,7 @@ async function feedPage(env, url) {
   let body = "";
   for (const r of items) {
     const s = SL[r.status] || SL.open;
-    const d = r.window.dateStart === r.window.dateEnd ? r.window.dateStart : r.window.dateStart + " ~ " + r.window.dateEnd;
+    const d = esc(r.window.dateStart === r.window.dateEnd ? r.window.dateStart : r.window.dateStart + " ~ " + r.window.dateEnd);
     const owner = await env.BOARD_KV.get("player:" + r.ownerId, "json");
     body += `<div class="card"><a href="/r/${r.id}">
       <div><b>${esc(r.region)}</b> \xB7 ${esc(r.court || "\u573A\u5730\u672A\u5B9A")}<span class="badge ${s[1]}">${s[0]}</span></div>
@@ -629,7 +685,7 @@ async function detailPage(env, reqId) {
   const copyText = copyTextFor(env, r).replace(/BOARD_URL_PLACEHOLDER/g, "http://x").replace("http://x", boardBase(env));
   const SL = { open: ["\u62A5\u540D\u4E2D", "b-open"], confirmed: ["\u5DF2\u7EA6\u6210", "b-confirmed"], completed: ["\u5DF2\u5B8C\u6210", "b-completed"], expired: ["\u5DF2\u8FC7\u671F", "b-expired"], cancelled: ["\u5DF2\u53D6\u6D88", "b-cancelled"] };
   const s = SL[p.status] || SL.open;
-  const d = p.window.dateStart === p.window.dateEnd ? p.window.dateStart : p.window.dateStart + " ~ " + p.window.dateEnd;
+  const d = esc(p.window.dateStart === p.window.dateEnd ? p.window.dateStart : p.window.dateStart + " ~ " + p.window.dateEnd);
   const lr = Object.entries(p.levelReq || {}).map(([k, v]) => `${dimName(k)} ${fmt(v[0])}-${fmt(v[1])}`).join("\uFF0C");
   return html(`<p><a class="back" href="/">\u2190 \u8FD4\u56DE\u516C\u544A\u677F</a></p>
     <div class="card">
